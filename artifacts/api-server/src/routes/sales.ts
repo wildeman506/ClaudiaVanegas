@@ -1,0 +1,432 @@
+import { Router, type IRouter } from "express";
+import { eq, and, gte, lte, desc, type SQL } from "drizzle-orm";
+import { sql } from "drizzle-orm";
+import {
+  db, salesTable, saleItemsTable, productsTable, customersTable, usersTable,
+  accountsReceivableTable, arPaymentsTable, productVariantsTable,
+} from "@workspace/db";
+import { requireAuth, requireAdmin } from "../lib/auth";
+import { sendInvoiceEmail, sendPaymentLinkEmail } from "../lib/email";
+import { bogotaNow } from "../lib/tz";
+import { createBoldPaymentLink } from "../lib/bold";
+
+const router: IRouter = Router();
+
+async function buildSaleResponse(saleId: number) {
+  const [sale] = await db.select().from(salesTable).where(eq(salesTable.id, saleId));
+  if (!sale) return null;
+  const [user] = await db.select().from(usersTable).where(eq(usersTable.id, sale.userId));
+  const customer = sale.customerId
+    ? (await db.select().from(customersTable).where(eq(customersTable.id, sale.customerId)))[0]
+    : null;
+  const items = await db.select({
+    id: saleItemsTable.id,
+    productId: saleItemsTable.productId,
+    variantId: saleItemsTable.variantId,
+    qty: saleItemsTable.qty,
+    unitPrice: saleItemsTable.unitPrice,
+    subtotal: saleItemsTable.subtotal,
+    productName: productsTable.name,
+    description: productsTable.description,
+    variantColor: productVariantsTable.color,
+    variantSize: productVariantsTable.size,
+    variantSku: productVariantsTable.sku,
+  }).from(saleItemsTable)
+    .leftJoin(productsTable, eq(saleItemsTable.productId, productsTable.id))
+    .leftJoin(productVariantsTable, eq(saleItemsTable.variantId, productVariantsTable.id))
+    .where(eq(saleItemsTable.saleId, saleId));
+
+  return {
+    ...sale,
+    total: parseFloat(sale.total),
+    boldFee: sale.boldFee ? parseFloat(sale.boldFee) : null,
+    paymentLink: sale.paymentLink ?? null,
+    catalogOrderId: sale.catalogOrderId ?? null,
+    boldPaymentStatus: sale.boldPaymentStatus ?? null,
+    voided: sale.voided,
+    voidedAt: sale.voidedAt,
+    voidReason: sale.voidReason,
+    userName: user?.name ?? null,
+    customerName: customer ? `${customer.firstName} ${customer.lastName}` : null,
+    customerCedula: customer?.cedula ?? null,
+    customerEmail: customer?.email ?? null,
+    customerPhone: customer?.phone ?? null,
+    items: items.map(i => ({
+      ...i,
+      productName: i.productName ?? "Desconocido",
+      description: i.description ?? null,
+      variantColor: i.variantColor ?? null,
+      variantSize: i.variantSize ?? null,
+      variantSku: i.variantSku ?? null,
+      unitPrice: parseFloat(i.unitPrice),
+      subtotal: parseFloat(i.subtotal),
+    })),
+  };
+}
+
+router.get("/sales", requireAuth, async (req, res): Promise<void> => {
+  const { userId, paymentType, from, to, search } = req.query;
+  const conditions: SQL[] = [];
+
+  if (req.user!.role === "cajero") {
+    conditions.push(eq(salesTable.userId, req.user!.userId));
+  } else if (userId && typeof userId === "string") {
+    conditions.push(eq(salesTable.userId, parseInt(userId, 10)));
+  }
+  if (paymentType && typeof paymentType === "string") {
+    conditions.push(eq(salesTable.paymentType, paymentType as "efectivo" | "credito" | "datafono" | "link"));
+  }
+  if (from && typeof from === "string") {
+    conditions.push(gte(salesTable.createdAt, new Date(from)));
+  }
+  if (to && typeof to === "string") {
+    conditions.push(lte(salesTable.createdAt, new Date(to)));
+  }
+
+  const sales = conditions.length > 0
+    ? await db.select().from(salesTable).where(and(...conditions)).orderBy(desc(salesTable.createdAt))
+    : await db.select().from(salesTable).orderBy(desc(salesTable.createdAt));
+
+  let results = (await Promise.all(sales.map(s => buildSaleResponse(s.id)))).filter(Boolean) as NonNullable<Awaited<ReturnType<typeof buildSaleResponse>>>[];
+
+  if (search && typeof search === "string") {
+    const q = search.toLowerCase();
+    results = results.filter(r =>
+      r.customerName?.toLowerCase().includes(q) ||
+      r.customerCedula?.toLowerCase().includes(q)
+    );
+  }
+
+  res.json(results);
+});
+
+router.post("/sales", requireAuth, async (req, res): Promise<void> => {
+  const { customerId, paymentType, notes, items, advanceAmount, chargedAmount } = req.body as {
+    customerId?: number;
+    paymentType: "efectivo" | "credito" | "datafono" | "link";
+    notes?: string;
+    items: { productId: number; variantId?: number; qty: number; unitPrice: number }[];
+    advanceAmount?: number;
+    chargedAmount?: number;
+  };
+
+  const validPaymentTypes = ["efectivo", "credito", "datafono", "link"];
+  if (!paymentType || !validPaymentTypes.includes(paymentType) || !items?.length) {
+    res.status(400).json({ error: "Tipo de pago e items son requeridos" });
+    return;
+  }
+
+  // Validate all products/variants exist and have enough stock
+  for (const item of items) {
+    if (item.qty <= 0 || item.unitPrice < 0) {
+      res.status(400).json({ error: `Cantidad o precio inválido para el producto ${item.productId}` });
+      return;
+    }
+    const [product] = await db.select().from(productsTable).where(eq(productsTable.id, item.productId));
+    if (!product) {
+      res.status(400).json({ error: `Producto con ID ${item.productId} no existe` });
+      return;
+    }
+
+    if (item.variantId) {
+      const [variant] = await db
+        .select()
+        .from(productVariantsTable)
+        .where(and(eq(productVariantsTable.id, item.variantId), eq(productVariantsTable.productId, item.productId)));
+      if (!variant) {
+        res.status(400).json({ error: `Variante ${item.variantId} no es válida para el producto "${product.name}"` });
+        return;
+      }
+      if (variant.stock < item.qty) {
+        res.status(400).json({ error: `Stock insuficiente para "${product.name}" (${variant.color} / ${variant.size}). Disponible: ${variant.stock}` });
+        return;
+      }
+    } else {
+      if (product.stock < item.qty) {
+        res.status(400).json({ error: `Stock insuficiente para "${product.name}". Disponible: ${product.stock}` });
+        return;
+      }
+    }
+  }
+
+  const total = items.reduce((sum, i) => sum + i.qty * i.unitPrice, 0);
+  const advance = Math.max(0, Math.min(advanceAmount ?? 0, total));
+
+  const saleId = await db.transaction(async (tx) => {
+    const [sale] = await tx.insert(salesTable).values({
+      userId: req.user!.userId,
+      customerId: customerId ?? null,
+      paymentType,
+      total: String(total),
+      notes,
+    }).returning();
+
+    await tx.insert(saleItemsTable).values(
+      items.map(i => ({
+        saleId: sale.id,
+        productId: i.productId,
+        variantId: i.variantId ?? null,
+        qty: i.qty,
+        unitPrice: String(i.unitPrice),
+        subtotal: String(i.qty * i.unitPrice),
+      }))
+    );
+
+    // Deduct stock
+    for (const item of items) {
+      if (item.variantId) {
+        await tx.update(productVariantsTable)
+          .set({ stock: sql`${productVariantsTable.stock} - ${item.qty}` })
+          .where(eq(productVariantsTable.id, item.variantId));
+        // Sync product total stock
+        await tx.update(productsTable)
+          .set({ stock: sql`(SELECT COALESCE(SUM(stock), 0) FROM product_variants WHERE product_id = ${item.productId})` })
+          .where(eq(productsTable.id, item.productId));
+      } else {
+        await tx.update(productsTable)
+          .set({ stock: sql`${productsTable.stock} - ${item.qty}` })
+          .where(eq(productsTable.id, item.productId));
+      }
+    }
+
+    // For credit sales, create accounts receivable entry
+    if (paymentType === "credito") {
+      const { y: dy, m: dm, d: dd } = bogotaNow();
+      const base = new Date(Date.UTC(dy, dm, dd + 15));
+      const dueDateStr = `${base.getUTCFullYear()}-${String(base.getUTCMonth() + 1).padStart(2, "0")}-${String(base.getUTCDate()).padStart(2, "0")}`;
+
+      const initialPaid = advance;
+      const status = initialPaid >= total ? "paid" : initialPaid > 0 ? "partial" : "pending";
+
+      const [ar] = await tx.insert(accountsReceivableTable).values({
+        saleId: sale.id,
+        customerId: customerId ?? null,
+        totalAmount: String(total),
+        paidAmount: String(initialPaid),
+        advanceAmount: String(advance),
+        dueDate: dueDateStr,
+        status,
+      }).returning();
+
+      if (advance > 0) {
+        await tx.insert(arPaymentsTable).values({
+          accountReceivableId: ar.id,
+          amount: String(advance),
+          notes: "Anticipo inicial de la venta",
+        });
+      }
+    }
+
+    return sale.id;
+  });
+
+  let result = await buildSaleResponse(saleId);
+  let boldError: string | null = null;
+
+  if (paymentType === "link" && result) {
+    try {
+      const boldResult = await createBoldPaymentLink({
+        amountCOP: total,
+        grossAmountCOP: chargedAmount,
+        description: `Factura #${saleId}`,
+        reference: `sale-${saleId}`,
+        customer: {
+          fullName: result.customerName ?? undefined,
+          email: result.customerEmail ?? undefined,
+          phone: result.customerPhone ?? undefined,
+        },
+      });
+      await db.update(salesTable)
+        .set({
+          paymentLink: boldResult.url,
+          boldFee: String(boldResult.fee),
+          boldLinkId: boldResult.linkId ?? undefined,
+          boldReference: boldResult.reference,
+          boldPaymentStatus: "pending",
+        })
+        .where(eq(salesTable.id, saleId));
+      result = {
+        ...result,
+        paymentLink: boldResult.url,
+        boldFee: boldResult.fee,
+        boldPaymentStatus: "pending",
+      } as typeof result;
+    } catch (err) {
+      boldError = (err as Error).message ?? "Error generando link de pago Bold";
+      console.error("[bold] Error generando link:", boldError);
+    }
+  }
+
+  res.status(201).json({ ...result, boldError });
+
+  if (result?.customerEmail) {
+    sendInvoiceEmail({
+      saleId: result.id,
+      createdAt: result.createdAt,
+      paymentType: result.paymentType as "efectivo" | "credito" | "datafono" | "link",
+      customerName: result.customerName ?? result.customerEmail,
+      customerEmail: result.customerEmail,
+      customerCedula: result.customerCedula,
+      customerPhone: result.customerPhone,
+      items: result.items,
+      total: result.total,
+      notes: result.notes,
+    }).catch(err => {
+      console.error("[email] Error enviando factura:", err?.message ?? err);
+    });
+
+    if (result.paymentLink) {
+      sendPaymentLinkEmail({
+        saleId: result.id,
+        customerName: result.customerName ?? result.customerEmail,
+        customerEmail: result.customerEmail,
+        total: result.total,
+        paymentLink: result.paymentLink,
+      }).catch(err => {
+        console.error("[email] Error enviando link de pago:", err?.message ?? err);
+      });
+    }
+  }
+});
+
+router.get("/sales/:id", requireAuth, async (req, res): Promise<void> => {
+  const id = parseInt(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id, 10);
+  const result = await buildSaleResponse(id);
+  if (!result) { res.status(404).json({ error: "Venta no encontrada" }); return; }
+  if (req.user!.role === "cajero" && result.userId !== req.user!.userId) {
+    res.status(403).json({ error: "Acceso denegado" }); return;
+  }
+  res.json(result);
+});
+
+router.patch("/sales/:id/payment-type", requireAuth, requireAdmin, async (req, res): Promise<void> => {
+  const id = parseInt(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id, 10);
+  const { paymentType } = req.body as { paymentType?: string };
+
+  const allowed = ["efectivo", "datafono", "link"] as const;
+  if (!paymentType || !(allowed as readonly string[]).includes(paymentType)) {
+    res.status(400).json({ error: "Método de pago inválido. Opciones: efectivo, datafono, link" });
+    return;
+  }
+
+  const [sale] = await db.select().from(salesTable).where(eq(salesTable.id, id));
+  if (!sale) { res.status(404).json({ error: "Venta no encontrada" }); return; }
+  if (sale.voided) { res.status(400).json({ error: "No se puede cambiar el método de pago de una venta anulada" }); return; }
+  if (sale.paymentType === "link" && sale.boldPaymentStatus === "paid") {
+    res.status(400).json({ error: "No se puede cambiar el método de pago de un link Bold ya pagado" });
+    return;
+  }
+
+  const updateFields: Record<string, unknown> = { paymentType };
+
+  if (sale.paymentType === "link" && paymentType !== "link") {
+    Object.assign(updateFields, {
+      paymentLink: null, boldLinkId: null, boldReference: null, boldPaymentStatus: null, boldFee: null,
+    });
+  }
+
+  await db.update(salesTable).set(updateFields as any).where(eq(salesTable.id, id));
+
+  let result = await buildSaleResponse(id);
+  let boldError: string | null = null;
+
+  const needsNewLink = !sale.paymentLink
+    || sale.boldPaymentStatus === "expired"
+    || sale.boldPaymentStatus === "failed";
+
+  if (paymentType === "link" && needsNewLink && result) {
+    try {
+      const total = parseFloat(sale.total);
+      const grossAmountCOP = Math.floor((total + 900) / 0.9421);
+      const boldResult = await createBoldPaymentLink({
+        amountCOP: total,
+        grossAmountCOP,
+        description: `Factura #${id}`,
+        reference: `sale-${id}`,
+        customer: {
+          fullName: result.customerName ?? undefined,
+          email: result.customerEmail ?? undefined,
+          phone: result.customerPhone ?? undefined,
+        },
+      });
+      await db.update(salesTable).set({
+        paymentLink: boldResult.url,
+        boldFee: String(boldResult.fee),
+        boldLinkId: boldResult.linkId ?? undefined,
+        boldReference: boldResult.reference,
+        boldPaymentStatus: "pending",
+      }).where(eq(salesTable.id, id));
+      result = {
+        ...result,
+        paymentLink: boldResult.url,
+        boldFee: boldResult.fee,
+        boldPaymentStatus: "pending",
+      } as typeof result;
+    } catch (err) {
+      boldError = (err as Error).message ?? "Error generando link de pago Bold";
+      console.error("[bold] Error generando link:", boldError);
+    }
+  }
+
+  res.json({ ...result, boldError });
+});
+
+router.post("/sales/:id/void", requireAuth, requireAdmin, async (req, res): Promise<void> => {
+  const id = parseInt(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id, 10);
+  const { reason } = req.body as { reason?: string };
+  if (!reason || !reason.trim()) {
+    res.status(400).json({ error: "La observación es requerida para anular la venta" });
+    return;
+  }
+
+  const [sale] = await db.select().from(salesTable).where(eq(salesTable.id, id));
+  if (!sale) { res.status(404).json({ error: "Venta no encontrada" }); return; }
+  if (sale.voided) { res.status(400).json({ error: "La venta ya fue anulada" }); return; }
+
+  let alreadyVoided = false;
+
+  await db.transaction(async (tx) => {
+    const updated = await tx.update(salesTable).set({
+      voided: true,
+      voidedAt: new Date(),
+      voidReason: reason.trim(),
+    }).where(and(eq(salesTable.id, id), eq(salesTable.voided, false))).returning({ id: salesTable.id });
+
+    if (updated.length === 0) {
+      alreadyVoided = true;
+      return;
+    }
+
+    const items = await tx.select().from(saleItemsTable).where(eq(saleItemsTable.saleId, id));
+
+    // Return items to stock
+    for (const item of items) {
+      if (item.variantId) {
+        await tx.update(productVariantsTable)
+          .set({ stock: sql`${productVariantsTable.stock} + ${item.qty}` })
+          .where(eq(productVariantsTable.id, item.variantId));
+        // Sync product total stock
+        await tx.update(productsTable)
+          .set({ stock: sql`(SELECT COALESCE(SUM(stock), 0) FROM product_variants WHERE product_id = ${item.productId})` })
+          .where(eq(productsTable.id, item.productId));
+      } else {
+        await tx.update(productsTable)
+          .set({ stock: sql`${productsTable.stock} + ${item.qty}` })
+          .where(eq(productsTable.id, item.productId));
+      }
+    }
+
+    const [ar] = await tx.select().from(accountsReceivableTable).where(eq(accountsReceivableTable.saleId, id));
+    if (ar) {
+      await tx.delete(arPaymentsTable).where(eq(arPaymentsTable.accountReceivableId, ar.id));
+      await tx.delete(accountsReceivableTable).where(eq(accountsReceivableTable.id, ar.id));
+    }
+  });
+
+  if (alreadyVoided) { res.status(400).json({ error: "La venta ya fue anulada" }); return; }
+
+  const result = await buildSaleResponse(id);
+  res.json(result);
+});
+
+export default router;
